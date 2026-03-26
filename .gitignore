@@ -8,5 +8,6 @@ build/
 venv/
 .venv/
 .env
+.cache_env
 *.log
 worker.log

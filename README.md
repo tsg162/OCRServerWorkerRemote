@@ -21,10 +21,12 @@ bash deploy.sh
 ```
 
 The deploy script will:
+- Check available disk space
+- Redirect all heavy data (model weights, pip cache) to `/workspace/` (not the small root disk)
 - Install `ocrdoctotext` (bundled in this repo)
 - Install Python dependencies
 - Prompt for `WORKER_SECRET` (generates one if you press Enter)
-- Pre-download and cache model weights (~2GB, first run only)
+- Pre-download and cache model weights to `/workspace/.cache/huggingface/` (~4GB, first run only)
 
 ### 3. Start
 
@@ -35,6 +37,9 @@ python3 -m gpu_worker.main
 # Background:
 nohup python3 -m gpu_worker.main > worker.log 2>&1 &
 ```
+
+Note: The worker automatically sets `HF_HOME=/workspace/.cache/huggingface` so model
+weights are always loaded from the workspace volume, not the root disk.
 
 ### 4. Verify
 
@@ -81,6 +86,7 @@ Edit `.env` (created by deploy.sh):
 | `CALLBACK_URL` | No | Control node webhook URL (polling works without this) |
 | `CALLBACK_SECRET` | No | Key sent with webhook callbacks |
 | `OCR_MODEL` | No | HuggingFace model ID (default: `lightonai/LightOnOCR-2-1B`) |
+| `HF_HOME` | No | HuggingFace cache dir (default: `/workspace/.cache/huggingface`) |
 | `MAX_QUEUE_SIZE` | No | Max queued jobs (default: 100) |
 
 ## What's Included
