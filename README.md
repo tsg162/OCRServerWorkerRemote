@@ -6,45 +6,49 @@ Remote GPU OCR worker for the OCRServer system. Runs on a VAST.ai GPU instance, 
 
 ### 1. Create Instance
 
-- **Template: PyTorch (Vast)**
+- **Template: PyTorch (Vast)** (comes with port 8080 exposed by default)
 - GPU: 4+ GB VRAM (1B model in bfloat16 is ~2GB)
-- **Expose port 8000**
+- No extra port config needed — the deploy script auto-detects an available exposed port
 
 ### 2. Clone and Deploy
 
 ```bash
 ssh root@<vast-ip>
 cd /workspace
-git clone https://github.com/<your-user>/ocr-gpu-worker.git
-cd ocr-gpu-worker
+git clone https://github.com/tsg162/OCRServerWorkerRemote.git
+cd OCRServerWorkerRemote
 bash deploy.sh
 ```
 
 The deploy script will:
 - Check available disk space
+- **Auto-detect an exposed port** (prefers 8080, which PyTorch template exposes by default)
 - Redirect all heavy data (model weights, pip cache) to `/workspace/` (not the small root disk)
-- Install `ocrdoctotext` (bundled in this repo)
-- Install Python dependencies
-- Prompt for `WORKER_SECRET` (generates one if you press Enter)
-- Pre-download and cache model weights to `/workspace/.cache/huggingface/` (~4GB, first run only)
+- Install `ocrdoctotext` (bundled) and Python dependencies
+- **Auto-generate `WORKER_SECRET`** (no prompts — just prints the values you need)
+- Pre-download model weights to `/workspace/.cache/huggingface/` (~4GB, first run only)
+- **Print the exact `WORKER_URL` and `WORKER_API_KEY`** to paste into your control node `.env`
 
 ### 3. Start
 
 ```bash
-# Foreground:
 python3 -m gpu_worker.main
-
-# Background:
-nohup python3 -m gpu_worker.main > worker.log 2>&1 &
 ```
 
-Note: The worker automatically sets `HF_HOME=/workspace/.cache/huggingface` so model
-weights are always loaded from the workspace volume, not the root disk.
+On startup, the worker logs its public IP and URL:
+```
+Public IP: 209.20.157.9
+Worker URL: http://209.20.157.9:10300
+Health check: curl http://209.20.157.9:10300/health
+Model loaded — ready to accept jobs
+```
 
-### 4. Verify
+### 4. Configure Control Node
 
-```bash
-curl http://localhost:8000/health
+Copy the values printed by `deploy.sh` into your control node's `control/.env`:
+```
+WORKER_URL=http://209.20.157.9:10300
+WORKER_API_KEY=<the-secret-from-deploy>
 ```
 
 ## API
