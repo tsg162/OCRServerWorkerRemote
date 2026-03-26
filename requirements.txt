@@ -9,3 +9,4 @@ torch>=2.0
 transformers>=4.50
 pillow>=10.0
 pypdfium2>=4.0
+rich>=13.0
