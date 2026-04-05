@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 
 class WorkerSettings(BaseSettings):
     HOST: str = "0.0.0.0"
-    PORT: int = 5000
+    PORT: int = 5001
     WORKER_SECRET: str = ""
     CALLBACK_URL: str = ""
     CALLBACK_SECRET: str = ""
