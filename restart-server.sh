@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT=$(grep '^PORT=' .env 2>/dev/null | cut -d= -f2 || echo 5001)
-TUNNEL_TOKEN=$(grep '^OCRHARBOR_TUNNEL_TOKEN=' .env 2>/dev/null | cut -d= -f2 || true)
+TUNNEL_TOKEN=$(grep '^OCRHARBOR_TUNNEL_TOKEN=' .env 2>/dev/null | sed 's/^OCRHARBOR_TUNNEL_TOKEN=//' || true)
 LOG="$(pwd)/worker.log"
 TUNNEL_LOG="$(pwd)/tunnel.log"
 
