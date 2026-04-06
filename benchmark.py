@@ -417,9 +417,12 @@ async def run_live_observation(
         total_pages = len(completed_elapsed)
         print()  # newline after progress
 
+        # `pages` is the total observed (completions + failures), to match
+        # standalone mode where `pages` is total submitted. __post_init__
+        # subtracts failures to compute throughput.
         result = BatchSizeResult(
             batch_size=batch_size,
-            pages=total_pages,
+            pages=total_pages + failed_count,
             total_seconds=round(wall_elapsed, 2),
             failures=failed_count,
         )
@@ -737,8 +740,8 @@ Examples:
     # Standalone mode options
     parser.add_argument("--pages", type=int, default=50,
                         help="Number of synthetic test pages in standalone mode (default: 50)")
-    parser.add_argument("--batch-sizes", default="1,2,4,8,16",
-                        help="Comma-separated batch sizes to sweep (default: 1,2,4,8,16)")
+    parser.add_argument("--batch-sizes", default="6,8,10,12,14",
+                        help="Comma-separated batch sizes to sweep (default: 6,8,10,12,14)")
     parser.add_argument("--concurrency", type=int, default=24,
                         help="Max concurrent HTTP submissions in standalone mode")
     parser.add_argument("--test-dir", default=None,
