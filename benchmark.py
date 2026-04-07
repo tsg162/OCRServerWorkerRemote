@@ -38,10 +38,11 @@ import asyncio
 import io
 import json
 import os
+import random
 import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -239,6 +240,12 @@ class BatchSizeResult:
     p95_server_elapsed: float = 0.0
     failures: int = 0
     cost_per_1k_pages: float | None = None
+    # Raw per-page server elapsed times (used by aggregate_cycles to recompute
+    # percentiles correctly across cycles instead of averaging averages).
+    elapsed_samples: list[float] = field(default_factory=list)
+    # Per-cycle pg/hr values when this result was produced by aggregating
+    # multiple cycles. Empty for single-run results.
+    cycle_pages_per_hour: list[float] = field(default_factory=list)
 
     def __post_init__(self):
         if self.total_seconds > 0 and self.pages > 0:
@@ -434,7 +441,54 @@ async def run_live_observation(
                 sorted(completed_elapsed)[int(len(completed_elapsed) * 0.95)], 3
             )
 
+        # Keep raw samples around so aggregate_cycles() can recompute stats
+        # over the union of samples instead of averaging averages.
+        result.elapsed_samples = list(completed_elapsed)
         return result
+
+
+def aggregate_cycles(
+    per_cycle: dict[int, list[BatchSizeResult]],
+) -> list[BatchSizeResult]:
+    """
+    Combine multiple per-cycle observations of the same batch_size into a
+    single BatchSizeResult.
+
+    Throughput is computed from summed totals (NOT averaged from per-cycle
+    pg/hr) so that windows containing fewer pages don't get equal weight to
+    denser windows. Percentiles are recomputed over the union of all raw
+    elapsed_samples for the same reason.
+    """
+    aggregated: list[BatchSizeResult] = []
+    for bs in sorted(per_cycle.keys()):
+        runs = per_cycle[bs]
+        if not runs:
+            continue
+
+        total_pages = sum(r.pages for r in runs)
+        total_failures = sum(r.failures for r in runs)
+        total_seconds = sum(r.total_seconds for r in runs)
+        all_samples: list[float] = []
+        for r in runs:
+            all_samples.extend(r.elapsed_samples)
+
+        merged = BatchSizeResult(
+            batch_size=bs,
+            pages=total_pages,
+            total_seconds=round(total_seconds, 2),
+            failures=total_failures,
+        )
+        if all_samples:
+            merged.avg_server_elapsed = round(statistics.mean(all_samples), 3)
+            merged.median_server_elapsed = round(statistics.median(all_samples), 3)
+            merged.p95_server_elapsed = round(
+                sorted(all_samples)[int(len(all_samples) * 0.95)], 3
+            )
+        # Preserve per-cycle pg/hr so print_results can show variance.
+        merged.cycle_pages_per_hour = [round(r.pages_per_hour, 1) for r in runs]
+        merged.elapsed_samples = all_samples
+        aggregated.append(merged)
+    return aggregated
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +537,17 @@ def print_results(
             vals.append(f"{r.cost_per_1k_pages:>8.4f}" if r.cost_per_1k_pages else f"{'N/A':>8}")
         print(" | ".join(vals))
 
+        # When this row is the result of aggregating multiple cycles, print
+        # the per-cycle pg/hr values + a spread% so the user can see whether
+        # the aggregate is built on consistent or wildly varying samples.
+        if len(r.cycle_pages_per_hour) > 1:
+            cycles_str = ", ".join(f"{v:.0f}" for v in r.cycle_pages_per_hour)
+            cmin = min(r.cycle_pages_per_hour)
+            cmax = max(r.cycle_pages_per_hour)
+            mean = sum(r.cycle_pages_per_hour) / len(r.cycle_pages_per_hour)
+            spread_pct = ((cmax - cmin) / mean * 100) if mean > 0 else 0
+            print(f"{'':>6}   cycles pg/hr: [{cycles_str}]  spread={spread_pct:.0f}%")
+
     print()
     if best_throughput:
         print(f"  Fastest throughput : batch_size={best_throughput.batch_size}"
@@ -511,6 +576,7 @@ def print_results(
                 "p95_server_elapsed": r.p95_server_elapsed,
                 "failures": r.failures,
                 "cost_per_1k_pages": r.cost_per_1k_pages,
+                "cycle_pages_per_hour": r.cycle_pages_per_hour,
             }
             for r in results
         ],
@@ -628,9 +694,11 @@ async def async_main(args):
 
     # ----- LIVE MODE -----
     if args.live:
+        cycles = max(1, args.cycles)
         print(f"Mode: LIVE (observing real OCRHarbor traffic)")
-        print(f"Window per batch_size: {args.window}s")
-        total_time = len(batch_sizes) * (args.window + 5)
+        print(f"Window per batch_size per cycle: {args.window}s")
+        print(f"Cycles: {cycles}  (randomized order each cycle)")
+        total_time = cycles * len(batch_sizes) * (args.window + 5)
         print(f"Estimated total time: ~{total_time / 60:.0f} min\n")
 
         # Verify there's actually work flowing
@@ -641,21 +709,30 @@ async def async_main(args):
                 print("WARNING: Worker queue is empty. Make sure OCRHarbor is")
                 print("         feeding jobs, otherwise there's nothing to measure.\n")
 
-        results: list[BatchSizeResult] = []
-        for bs in batch_sizes:
-            print(f"\n--- batch_size={bs} (observing for {args.window}s) ---")
-            result = await run_live_observation(
-                url=url, headers=headers,
-                batch_size=bs, window_seconds=args.window,
-            )
-            if result.pages == 0:
-                print(f"  WARNING: 0 pages completed — queue may be starved")
-            if args.gpu_cost and result.pages_per_hour > 0:
-                result.cost_per_1k_pages = round(
-                    (args.gpu_cost / result.pages_per_hour) * 1000, 4
+        per_cycle: dict[int, list[BatchSizeResult]] = {bs: [] for bs in batch_sizes}
+        for cycle_idx in range(cycles):
+            order = list(batch_sizes)
+            random.shuffle(order)
+            print(f"\n=== Cycle {cycle_idx + 1}/{cycles}  order: {order} ===")
+            for bs in order:
+                print(f"\n--- batch_size={bs} (cycle {cycle_idx + 1}/{cycles}, "
+                      f"observing for {args.window}s) ---")
+                result = await run_live_observation(
+                    url=url, headers=headers,
+                    batch_size=bs, window_seconds=args.window,
                 )
-            results.append(result)
-            print(f"  Result: {result.pages_per_hour:.0f} pg/hr")
+                if result.pages == 0:
+                    print(f"  WARNING: 0 pages completed — queue may be starved")
+                per_cycle[bs].append(result)
+                print(f"  Result: {result.pages_per_hour:.0f} pg/hr")
+
+        # Aggregate cycles into one result per batch_size
+        results = aggregate_cycles(per_cycle)
+        for r in results:
+            if args.gpu_cost and r.pages_per_hour > 0:
+                r.cost_per_1k_pages = round(
+                    (args.gpu_cost / r.pages_per_hour) * 1000, 4
+                )
 
         # Restore a sensible default when done
         async with httpx.AsyncClient() as client:
@@ -734,14 +811,18 @@ Examples:
     # Mode selection
     parser.add_argument("--live", action="store_true",
                         help="Live mode: observe real OCRHarbor traffic instead of injecting synthetic images")
-    parser.add_argument("--window", type=int, default=1200,
-                        help="Seconds to observe each batch_size in live mode (default: 1200 = 20 min)")
+    parser.add_argument("--window", type=int, default=600,
+                        help="Seconds to observe each batch_size per cycle in live mode (default: 600 = 10 min)")
+    parser.add_argument("--cycles", type=int, default=3,
+                        help="Number of interleaved cycles in live mode (default: 3). Each cycle "
+                             "tests every batch_size in randomized order, then results are summed "
+                             "across cycles. Controls for traffic-mix and queue-depth drift.")
 
     # Standalone mode options
     parser.add_argument("--pages", type=int, default=50,
                         help="Number of synthetic test pages in standalone mode (default: 50)")
-    parser.add_argument("--batch-sizes", default="6,8,10,12,14",
-                        help="Comma-separated batch sizes to sweep (default: 6,8,10,12,14)")
+    parser.add_argument("--batch-sizes", default="5,6,7,8,9,10",
+                        help="Comma-separated batch sizes to sweep (default: 5,6,7,8,9,10)")
     parser.add_argument("--concurrency", type=int, default=24,
                         help="Max concurrent HTTP submissions in standalone mode")
     parser.add_argument("--test-dir", default=None,
