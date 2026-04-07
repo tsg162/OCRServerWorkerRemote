@@ -162,13 +162,39 @@ async def set_batch_config(
     headers: dict,
     batch_size: int,
     batch_wait: float = 0.3,
+    timeout: float = 60.0,
+    attempts: int = 3,
 ) -> None:
-    resp = await client.put(
-        f"{url}/config",
-        json={"batch_size": batch_size, "batch_wait_seconds": batch_wait},
-        headers=headers,
-    )
-    resp.raise_for_status()
+    """
+    PUT a new batch_size to the worker's /config endpoint.
+
+    Uses an explicit 60s timeout (instead of httpx's 5s default) because the
+    worker may be in the middle of a long batch when we try to reconfigure it,
+    and a small backoff retry to ride out transient stalls.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            resp = await client.put(
+                f"{url}/config",
+                json={"batch_size": batch_size, "batch_wait_seconds": batch_wait},
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            last_exc = e
+            if attempt < attempts - 1:
+                wait = 2 ** attempt  # 1s, 2s
+                print(
+                    f"\n  set_batch_config({batch_size}) failed: "
+                    f"{type(e).__name__}: {e} — retry {attempt + 2}/{attempts} in {wait}s",
+                    flush=True,
+                )
+                await asyncio.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def submit_job(
@@ -495,6 +521,84 @@ def aggregate_cycles(
 # Output / reporting  (shared)
 # ---------------------------------------------------------------------------
 
+def _build_report_dict(
+    results: list[BatchSizeResult],
+    gpu_name: str,
+    gpu_cost: float | None,
+    mode: str,
+    partial: bool = False,
+) -> dict:
+    """Build the JSON-serializable report dict for both final and checkpoint saves."""
+    best_value = None
+    best_throughput = None
+    for r in results:
+        if r.cost_per_1k_pages is not None:
+            if best_value is None or r.cost_per_1k_pages < best_value.cost_per_1k_pages:
+                best_value = r
+        if r.pages_per_hour > 0 and (
+            best_throughput is None or r.pages_per_hour > best_throughput.pages_per_hour
+        ):
+            best_throughput = r
+
+    return {
+        "gpu_name": gpu_name,
+        "gpu_cost_per_hr": gpu_cost,
+        "mode": mode,
+        "partial": partial,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "results": [
+            {
+                "batch_size": r.batch_size,
+                "pages": r.pages,
+                "total_seconds": r.total_seconds,
+                "pages_per_second": round(r.pages_per_second, 3),
+                "pages_per_hour": round(r.pages_per_hour, 1),
+                "avg_server_elapsed": r.avg_server_elapsed,
+                "median_server_elapsed": r.median_server_elapsed,
+                "p95_server_elapsed": r.p95_server_elapsed,
+                "failures": r.failures,
+                "cost_per_1k_pages": r.cost_per_1k_pages,
+                "cycle_pages_per_hour": r.cycle_pages_per_hour,
+            }
+            for r in results
+        ],
+        "best_throughput_batch_size": best_throughput.batch_size if best_throughput else None,
+        "best_value_batch_size": best_value.batch_size if best_value else None,
+    }
+
+
+def _gpu_slug(gpu_name: str) -> str:
+    return gpu_name.lower().replace(" ", "_").replace("/", "_")
+
+
+def save_checkpoint(
+    per_cycle: dict[int, list[BatchSizeResult]],
+    gpu_name: str,
+    gpu_cost: float | None,
+    mode: str = "live",
+) -> str:
+    """
+    Write a partial JSON report from the work-in-progress per_cycle dict to a
+    fixed checkpoint filename. Called after each batch_size completes so that
+    a crash never costs more than one window of progress.
+
+    The checkpoint file is overwritten on each call. The final timestamped
+    report is written separately by print_results() at the end of the run.
+    """
+    aggregated = aggregate_cycles(per_cycle)
+    for r in aggregated:
+        if gpu_cost and r.pages_per_hour > 0:
+            r.cost_per_1k_pages = round((gpu_cost / r.pages_per_hour) * 1000, 4)
+
+    report = _build_report_dict(
+        aggregated, gpu_name, gpu_cost, mode=mode, partial=True
+    )
+    path = f"benchmark_{_gpu_slug(gpu_name)}_checkpoint.json"
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+    return path
+
+
 def print_results(
     results: list[BatchSizeResult],
     gpu_name: str,
@@ -559,33 +663,8 @@ def print_results(
               f"  (at ${gpu_cost:.2f}/hr)")
     print()
 
-    report = {
-        "gpu_name": gpu_name,
-        "gpu_cost_per_hr": gpu_cost,
-        "mode": mode,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "results": [
-            {
-                "batch_size": r.batch_size,
-                "pages": r.pages,
-                "total_seconds": r.total_seconds,
-                "pages_per_second": round(r.pages_per_second, 3),
-                "pages_per_hour": round(r.pages_per_hour, 1),
-                "avg_server_elapsed": r.avg_server_elapsed,
-                "median_server_elapsed": r.median_server_elapsed,
-                "p95_server_elapsed": r.p95_server_elapsed,
-                "failures": r.failures,
-                "cost_per_1k_pages": r.cost_per_1k_pages,
-                "cycle_pages_per_hour": r.cycle_pages_per_hour,
-            }
-            for r in results
-        ],
-        "best_throughput_batch_size": best_throughput.batch_size if best_throughput else None,
-        "best_value_batch_size": best_value.batch_size if best_value else None,
-    }
-
-    slug = gpu_name.lower().replace(" ", "_").replace("/", "_")
-    report_path = f"benchmark_{slug}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    report = _build_report_dict(results, gpu_name, gpu_cost, mode=mode, partial=False)
+    report_path = f"benchmark_{_gpu_slug(gpu_name)}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"  Full report saved to: {report_path}")
@@ -717,14 +796,33 @@ async def async_main(args):
             for bs in order:
                 print(f"\n--- batch_size={bs} (cycle {cycle_idx + 1}/{cycles}, "
                       f"observing for {args.window}s) ---")
-                result = await run_live_observation(
-                    url=url, headers=headers,
-                    batch_size=bs, window_seconds=args.window,
-                )
+                try:
+                    result = await run_live_observation(
+                        url=url, headers=headers,
+                        batch_size=bs, window_seconds=args.window,
+                    )
+                except Exception as e:
+                    # Don't let a single failed window kill a 3-hour sweep.
+                    # Log, drop this batch_size for this cycle, keep going.
+                    print(
+                        f"\n  ERROR: batch_size={bs} cycle {cycle_idx + 1} failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    print(f"  skipping this batch_size for this cycle and continuing")
+                    continue
+
                 if result.pages == 0:
                     print(f"  WARNING: 0 pages completed — queue may be starved")
                 per_cycle[bs].append(result)
                 print(f"  Result: {result.pages_per_hour:.0f} pg/hr")
+
+                # Checkpoint after every successful window so a crash never
+                # costs more than ~one window of progress.
+                try:
+                    ckpt = save_checkpoint(per_cycle, gpu_name, args.gpu_cost)
+                    print(f"  checkpoint: {ckpt}")
+                except Exception as e:
+                    print(f"  (checkpoint save failed: {type(e).__name__}: {e})")
 
         # Aggregate cycles into one result per batch_size
         results = aggregate_cycles(per_cycle)
